@@ -71,8 +71,8 @@ impl TelegramChannel {
         self.transcription_provider = Some(provider);
         self
     }
-    /// convert markdown to telegram-safe html
-    fn markdown_to_html(&self, text: &str) -> String {
+    /// convert markdown to telegram-safe html (static version for use in closures)
+    fn markdown_to_html_static(text: &str) -> String {
         let mut result = text.to_string();
 
         // escape html
@@ -106,6 +106,11 @@ impl TelegramChannel {
             .to_string();
 
         result
+    }
+
+    /// convert markdown to telegram-safe html
+    fn markdown_to_html(&self, text: &str) -> String {
+        Self::markdown_to_html_static(text)
     }
 
     /// Send an outbound message
@@ -224,6 +229,7 @@ impl TelegramChannel {
             MediaType::Document => String::new(),
         }
     }
+
 }
 
 /// Media information from Telegram
@@ -334,6 +340,7 @@ impl Channel for TelegramChannel {
         let bus = self.bus.clone();
         let transcription_provider = self.transcription_provider.clone();
         let media_dir = self.media_dir.clone();
+        let allow_from = self.config.allow_from.clone();
 
         info!("Starting Telegram bot");
 
@@ -354,6 +361,7 @@ impl Channel for TelegramChannel {
             let bus = bus.clone();
             let transcription_provider = transcription_provider.clone();
             let media_dir = media_dir.clone();
+            let allow_from = allow_from.clone();
 
             async move {
                 // Get user info - skip if missing or bot
@@ -369,6 +377,24 @@ impl Channel for TelegramChannel {
                     }
                 };
 
+                // Check allow_from list (security: enforce access control)
+                let user_id_str = user.id.0.to_string();
+                let username = user.username.as_deref();
+                if !allow_from.is_empty() {
+                    let allowed = allow_from.contains(&user_id_str)
+                        || username
+                            .map(|u| allow_from.contains(&u.to_string()))
+                            .unwrap_or(false);
+                    if !allowed {
+                        debug!(
+                            "Ignoring message from unauthorized user: {} ({})",
+                            user_id_str,
+                            username.unwrap_or("no username")
+                        );
+                        return respond(());
+                    }
+                }
+
                 debug!("Telegram message from {:?}", user.id.0);
 
                 let chat_id = msg.chat.id.0.to_string();
@@ -378,59 +404,60 @@ impl Channel for TelegramChannel {
                     .send_chat_action(ChatId(msg.chat.id.0), ChatAction::Typing)
                     .await;
 
-                // Handle commands
+                // Handle commands - parse properly to handle /start foo and /help@botname
                 if let Some(text) = msg.text() {
-                    let text_lower = text.to_lowercase();
-                    if text_lower == "/start" {
-                        let welcome_msg = "👋 Welcome to mofaclaw!\n\n\
-                            I'm your agent assistant. Just send me a message and I'll process it.\n\n\
-                            Use /help for more information.";
-                        if let Err(e) = bot.send_message(ChatId(msg.chat.id.0), welcome_msg).await {
-                            error!("Failed to send welcome message: {}", e);
-                        }
-                        return respond(());
-                    }
-
-                    if text_lower == "/help" {
-                        let help_msg = "📖 **Help**\n\n\
-                                **How to use:**\n\
-                                Just send me any message and I'll forward it to the mofaclaw agent for processing.\n\n\
-                                **Supported:**\n\
-                                • Text messages\n\
-                                • Photos with captions\n\
-                                • Voice messages (transcribed if available)\n\
-                                • Audio files\n\
-                                • Documents\n\n\
-                                **Commands:**\n\
-                                /start - Show welcome message\n\
-                                /help - Show this help message\n\n\
-                                Responses will be sent back to this chat.";
-                        if let Err(_e) = bot
-                            .send_message(ChatId(msg.chat.id.0), help_msg)
-                            .parse_mode(ParseMode::MarkdownV2)
-                            .await
-                        {
-                            // Fallback to plain text if markdown fails
-                            let help_plain = "📖 Help\n\n\
-                                    How to use:\n\
-                                    Just send me any message and I'll forward it to the mofaclaw agent for processing.\n\n\
-                                    Supported:\n\
-                                    • Text messages\n\
-                                    • Photos with captions\n\
-                                    • Voice messages (transcribed if available)\n\
-                                    • Audio files\n\
-                                    • Documents\n\n\
-                                    Commands:\n\
-                                    /start - Show welcome message\n\
-                                    /help - Show this help message\n\n\
-                                    Responses will be sent back to this chat.";
-                            if let Err(e2) =
-                                bot.send_message(ChatId(msg.chat.id.0), help_plain).await
-                            {
-                                error!("Failed to send help message: {}", e2);
+                    // Parse command (handles /command@botname and /command args)
+                    let cmd = if let Some(cmd_text) = text.strip_prefix('/') {
+                        let end = cmd_text
+                            .find(' ')
+                            .or_else(|| cmd_text.find('@'))
+                            .unwrap_or(cmd_text.len());
+                        Some(cmd_text[..end].to_lowercase())
+                    } else {
+                        None
+                    };
+                    if let Some(cmd) = cmd {
+                        match cmd.as_str() {
+                            "start" => {
+                                let welcome_msg = "👋 Welcome to mofaclaw!\n\n\
+                                    I'm your agent assistant. Just send me a message and I'll process it.\n\n\
+                                    Use /help for more information.";
+                                if let Err(e) =
+                                    bot.send_message(ChatId(msg.chat.id.0), welcome_msg).await
+                                {
+                                    error!("Failed to send welcome message: {}", e);
+                                }
+                                return respond(());
+                            }
+                            "help" => {
+                                let help_markdown = "📖 **Help**\n\n\
+                                        **How to use:**\n\
+                                        Just send me any message and I'll forward it to the mofaclaw agent for processing.\n\n\
+                                        **Supported:**\n\
+                                        • Text messages\n\
+                                        • Photos with captions\n\
+                                        • Voice messages (transcribed if available)\n\
+                                        • Audio files\n\
+                                        • Documents\n\n\
+                                        **Commands:**\n\
+                                        /start - Show welcome message\n\
+                                        /help - Show this help message\n\n\
+                                        Responses will be sent back to this chat.";
+                                // Convert markdown to HTML for reliable parsing
+                                let help_html = Self::markdown_to_html_static(help_markdown);
+                                if let Err(e) = bot
+                                    .send_message(ChatId(msg.chat.id.0), help_html)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                                {
+                                    error!("Failed to send help message: {}", e);
+                                }
+                                return respond(());
+                            }
+                            _ => {
+                                // Unknown command, continue to process as regular message
                             }
                         }
-                        return respond(());
                     }
                 }
 
@@ -575,11 +602,26 @@ impl Channel for TelegramChannel {
     async fn stop(&self) -> Result<()> {
         *self.running.write().await = false;
 
-        // Cancel dispatcher task gracefully
+        // Cancel dispatcher task gracefully and wait for it to finish
         let mut handle_guard = self.dispatcher_handle.write().await;
         if let Some(handle) = handle_guard.take() {
+            // Request cancellation and wait for the dispatcher task to finish
             handle.abort();
-            info!("Telegram dispatcher task cancelled");
+            match handle.await {
+                Ok(_) => {
+                    // Dispatcher finished normally after abort request
+                    debug!("Telegram dispatcher task finished");
+                }
+                Err(e) if e.is_cancelled() => {
+                    // Expected cancellation error after abort; ignore
+                    debug!("Telegram dispatcher task cancelled");
+                }
+                Err(e) => {
+                    // Log unexpected join error
+                    error!("Telegram dispatcher task join error: {}", e);
+                }
+            }
+            info!("Telegram dispatcher task stopped");
         }
 
         info!("Stopping Telegram bot");
