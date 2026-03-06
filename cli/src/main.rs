@@ -349,6 +349,19 @@ async fn command_gateway(port: u16, verbose: bool) -> Result<()> {
     // create channel manager
     let channel_manager = ChannelManager::new(&config, bus.clone());
 
+    // Initialize RBAC manager if configured (must be before channel registrations)
+    let rbac_manager: Option<Arc<RbacManager>> = if let Ok(Some(rbac_config)) = config.get_rbac_config() {
+        if rbac_config.enabled {
+            let workspace = config.workspace_path();
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            Some(Arc::new(RbacManager::new(rbac_config, workspace, home)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // register dingtalk channel if enabled
     if config.channels.dingtalk.enabled {
         let dingtalk = DingTalkChannel::new(config.channels.dingtalk.clone(), bus.clone());
@@ -372,6 +385,11 @@ async fn command_gateway(port: u16, verbose: bool) -> Result<()> {
     // register feishu channel if enabled
     if config.channels.feishu.enabled {
         let feishu = FeishuChannel::new(config.channels.feishu.clone(), bus.clone());
+        let feishu = if let Some(ref rbac) = rbac_manager {
+            feishu.with_rbac(rbac.clone())
+        } else {
+            feishu
+        };
         channel_manager.register_channel(Arc::new(feishu)).await;
         println!("Feishu: enabled (via Python bridge on ws://localhost:3004)");
     }
