@@ -146,63 +146,63 @@ impl PermissionAwareRegistry {
         self
     }
 
-    /// Check whether the current user may execute the given tool.
-    ///
-    /// Returns `Ok(())` on success, `Err(ToolError::PermissionDenied)` on failure.
-    pub fn check_permission(&self, tool_name: &str) -> Result<()> {
-        // 1. If the RBAC manager says "check_tool_permission" for a
-        //    specific operation config, honour that first.
-        if let Some(ref rbac) = self.rbac_manager {
-            let result =
-                rbac.check_permission(self.user_role, &format!("tools.{}", tool_name), "execute");
+    fn check_permission_internal(
+        &self,
+        tool_name: &str,
+        operation: &str,
+        audit: bool,
+    ) -> Result<()> {
+        let resource = format!("tools.{}", tool_name);
 
-            // Audit if logger is present
-            if let Some(ref logger) = self.audit_logger {
-                logger.log(
-                    &self.user_id,
-                    self.user_role,
-                    &format!("tools.{}", tool_name),
-                    "execute",
-                    &result,
-                );
-            }
-
-            match result {
-                PermissionResult::Allowed => return Ok(()),
-                PermissionResult::Denied(reason) => {
-                    return Err(ToolError::PermissionDenied(reason).into());
+        let result = match self.requirements.get(tool_name) {
+            Some(req) if self.user_role >= req.min_role => {
+                if let Some(ref rbac) = self.rbac_manager {
+                    rbac.check_permission(self.user_role, &resource, operation)
+                } else {
+                    debug!(
+                        "Tool '{}' allowed for role '{}' (min: '{}')",
+                        tool_name,
+                        self.user_role.as_str(),
+                        req.min_role.as_str()
+                    );
+                    PermissionResult::Allowed
                 }
             }
-        }
-
-        // 2. Fallback to built-in default requirements.
-        if let Some(req) = self.requirements.get(tool_name) {
-            if self.user_role >= req.min_role {
-                debug!(
-                    "Tool '{}' allowed for role '{}' (min: '{}')",
-                    tool_name,
-                    self.user_role.as_str(),
-                    req.min_role.as_str()
-                );
-                return Ok(());
-            }
-            let reason = format!(
+            Some(req) => PermissionResult::Denied(format!(
                 "Tool '{}' requires role '{}' or higher, but user '{}' has role '{}'",
                 tool_name,
                 req.min_role.as_str(),
                 self.user_id,
                 self.user_role.as_str()
-            );
-            warn!("{}", reason);
-            return Err(ToolError::PermissionDenied(reason).into());
+            )),
+            None => PermissionResult::Denied(format!(
+                "Tool '{}' is not configured in the permission registry",
+                tool_name
+            )),
+        };
+
+        if audit && let Some(ref logger) = self.audit_logger {
+            logger.log(&self.user_id, self.user_role, &resource, operation, &result);
         }
 
-        // 3. Unknown tools default to allowed (with a debug message).
-        debug!(
-            "No permission requirement configured for tool '{}' — allowing",
-            tool_name
-        );
-        Ok(())
+        match result {
+            PermissionResult::Allowed => Ok(()),
+            PermissionResult::Denied(reason) => {
+                warn!("{}", reason);
+                Err(ToolError::PermissionDenied(reason).into())
+            }
+        }
+    }
+
+    fn check_permission_for_listing(&self, tool_name: &str) -> Result<()> {
+        self.check_permission_internal(tool_name, "execute", false)
+    }
+
+    /// Check whether the current user may execute the given tool.
+    ///
+    /// Returns `Ok(())` on success, `Err(ToolError::PermissionDenied)` on failure.
+    pub fn check_permission(&self, tool_name: &str) -> Result<()> {
+        self.check_permission_internal(tool_name, "execute", true)
     }
 
     /// Execute a tool by name, enforcing permission checks first.
@@ -224,7 +224,7 @@ impl PermissionAwareRegistry {
                     .pointer("/function/name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                self.check_permission(name).is_ok()
+                self.check_permission_for_listing(name).is_ok()
             })
             .collect()
     }
@@ -235,7 +235,7 @@ impl PermissionAwareRegistry {
         registry
             .tool_names()
             .into_iter()
-            .filter(|name| self.check_permission(name).is_ok())
+            .filter(|name| self.check_permission_for_listing(name).is_ok())
             .collect()
     }
 }
@@ -249,7 +249,7 @@ impl mofa_sdk::llm::ToolExecutor for PermissionAwareRegistry {
     async fn execute(&self, name: &str, arguments: &str) -> mofa_sdk::llm::LLMResult<String> {
         // Permission check
         self.check_permission(name)
-            .map_err(|e| mofa_sdk::llm::LLMError::Other(format!("Permission denied: {}", e)))?;
+            .map_err(|e| mofa_sdk::llm::LLMError::Other(e.to_string()))?;
 
         let registry = self.inner.read().await;
 
@@ -273,7 +273,7 @@ impl mofa_sdk::llm::ToolExecutor for PermissionAwareRegistry {
 
         let permitted: Vec<MofaTool> = all_tools
             .iter()
-            .filter(|t| self.check_permission(&t.name).is_ok())
+            .filter(|t| self.check_permission_for_listing(&t.name).is_ok())
             .map(|t| MofaTool::function(&t.name, &t.description, t.parameters_schema.clone()))
             .collect();
 
@@ -431,11 +431,10 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_tool_allowed() {
+    fn test_unknown_tool_denied() {
         let reg =
             PermissionAwareRegistry::new(empty_registry(), None, None, Role::Guest, "user1".into());
-        // Tools without any requirement default to allowed
-        assert!(reg.check_permission("my_custom_tool").is_ok());
+        assert!(reg.check_permission("my_custom_tool").is_err());
     }
 
     // -- With RbacManager --
@@ -506,19 +505,27 @@ mod tests {
     }
 
     #[test]
-    fn test_rbac_unconfigured_tool_allows() {
-        // RBAC is enabled but has no config for "read_file"
+    fn test_rbac_unconfigured_tool_still_uses_fallback_requirements() {
         let rbac = make_rbac_manager(HashMap::new());
-        let reg = PermissionAwareRegistry::new(
+        let guest_reg = PermissionAwareRegistry::new(
             empty_registry(),
-            Some(rbac),
+            Some(rbac.clone()),
             None,
             Role::Guest,
             "guest1".into(),
         );
 
-        // RbacManager returns Allowed for unconfigured tools
-        assert!(reg.check_permission("read_file").is_ok());
+        assert!(guest_reg.check_permission("read_file").is_ok());
+        assert!(guest_reg.check_permission("exec").is_err());
+
+        let admin_reg = PermissionAwareRegistry::new(
+            empty_registry(),
+            Some(rbac),
+            None,
+            Role::Admin,
+            "admin1".into(),
+        );
+        assert!(admin_reg.check_permission("exec").is_ok());
     }
 
     // -- Custom requirements override --
@@ -624,6 +631,29 @@ mod tests {
         assert_eq!(entry.resource, "tools.exec");
         assert_eq!(entry.operation, "execute");
         assert_eq!(entry.result, "denied");
+    }
+
+    #[tokio::test]
+    async fn test_listing_does_not_emit_execute_audit_logs() {
+        let registry = Arc::new(RwLock::new(ToolRegistry::new()));
+        {
+            let mut guard = registry.write().await;
+            guard.register(crate::tools::filesystem::ReadFileTool::new());
+        }
+
+        let rbac = make_rbac_manager(HashMap::new());
+        let (audit, mut rx) = AuditLogger::new();
+        let reg = PermissionAwareRegistry::new(
+            registry,
+            Some(rbac),
+            Some(Arc::new(audit)),
+            Role::Guest,
+            "guest1".into(),
+        );
+
+        let names = reg.get_permitted_tool_names().await;
+        assert_eq!(names, vec!["read_file".to_string()]);
+        assert!(rx.try_recv().is_err(), "listing should not be audited");
     }
 
     #[test]
