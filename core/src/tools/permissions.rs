@@ -14,6 +14,7 @@ use mofa_sdk::llm::Tool as MofaTool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -205,9 +206,76 @@ impl PermissionAwareRegistry {
         self.check_permission_internal(tool_name, "execute", true)
     }
 
+    fn check_fine_grained_permission(
+        &self,
+        tool_name: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<()> {
+        let Some(rbac) = self.rbac_manager.as_ref() else {
+            return Ok(());
+        };
+
+        match tool_name {
+            "read_file" | "list_dir" => {
+                self.check_path_argument(rbac, tool_name, "path", "read", params)
+            }
+            "write_file" | "edit_file" => {
+                self.check_path_argument(rbac, tool_name, "path", "write", params)
+            }
+            "exec" => self.check_command_argument(rbac, tool_name, "command", params),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_path_argument(
+        &self,
+        rbac: &RbacManager,
+        tool_name: &str,
+        argument_name: &str,
+        operation: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<()> {
+        let Some(path) = params.get(argument_name).and_then(|value| value.as_str()) else {
+            return Ok(());
+        };
+
+        let path = expand_tilde(Path::new(path));
+
+        match rbac.check_path_access(self.user_role, operation, &path) {
+            PermissionResult::Allowed => Ok(()),
+            PermissionResult::Denied(reason) => Err(ToolError::PermissionDenied(format!(
+                "Tool '{}' {} denied: {}",
+                tool_name, argument_name, reason
+            ))
+            .into()),
+        }
+    }
+
+    fn check_command_argument(
+        &self,
+        rbac: &RbacManager,
+        tool_name: &str,
+        argument_name: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<()> {
+        let Some(command) = params.get(argument_name).and_then(|value| value.as_str()) else {
+            return Ok(());
+        };
+
+        match rbac.check_command_access(self.user_role, command) {
+            PermissionResult::Allowed => Ok(()),
+            PermissionResult::Denied(reason) => Err(ToolError::PermissionDenied(format!(
+                "Tool '{}' {} denied: {}",
+                tool_name, argument_name, reason
+            ))
+            .into()),
+        }
+    }
+
     /// Execute a tool by name, enforcing permission checks first.
     pub async fn execute(&self, name: &str, params: &HashMap<String, Value>) -> Result<String> {
         self.check_permission(name)?;
+        self.check_fine_grained_permission(name, params)?;
 
         let registry = self.inner.read().await;
         registry.execute(name, params).await
@@ -251,8 +319,6 @@ impl mofa_sdk::llm::ToolExecutor for PermissionAwareRegistry {
         self.check_permission(name)
             .map_err(|e| mofa_sdk::llm::LLMError::Other(e.to_string()))?;
 
-        let registry = self.inner.read().await;
-
         let value: Value =
             serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -261,8 +327,7 @@ impl mofa_sdk::llm::ToolExecutor for PermissionAwareRegistry {
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
-        registry
-            .execute(name, &params)
+        self.execute(name, &params)
             .await
             .map_err(|e| mofa_sdk::llm::LLMError::Other(format!("Tool execution failed: {}", e)))
     }
@@ -279,6 +344,20 @@ impl mofa_sdk::llm::ToolExecutor for PermissionAwareRegistry {
 
         Ok(permitted)
     }
+}
+
+fn expand_tilde(path: &Path) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path.as_os_str().to_string_lossy()[2..]);
+        }
+    } else if path == Path::new("~")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+
+    path.to_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +804,101 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_denied_for_non_whitelisted_path() {
+        let registry = Arc::new(RwLock::new(ToolRegistry::new()));
+        {
+            let mut guard = registry.write().await;
+            guard.register(crate::tools::filesystem::WriteFileTool::new());
+        }
+
+        let mut fs_ops = HashMap::new();
+        let mut write_whitelist = HashMap::new();
+        write_whitelist.insert("member".to_string(), vec!["/workspace/**".to_string()]);
+        fs_ops.insert(
+            "write".to_string(),
+            OperationPermission {
+                min_role: "member".to_string(),
+                path_whitelist: write_whitelist,
+                path_blacklist: Vec::new(),
+                allowed: Vec::new(),
+            },
+        );
+
+        let mut tool_configs = HashMap::new();
+        tool_configs.insert(
+            "filesystem".to_string(),
+            ToolPermissionConfig { operations: fs_ops },
+        );
+
+        let reg = PermissionAwareRegistry::new(
+            registry,
+            Some(make_rbac_manager(tool_configs)),
+            None,
+            Role::Member,
+            "member1".into(),
+        );
+
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), serde_json::json!("/tmp/blocked.txt"));
+        params.insert("content".to_string(), serde_json::json!("blocked"));
+
+        let result = reg.execute("write_file", &params).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not whitelisted"),
+            "expected whitelist denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_denied_for_non_allowed_command() {
+        let registry = Arc::new(RwLock::new(ToolRegistry::new()));
+        {
+            let mut guard = registry.write().await;
+            guard.register(crate::tools::shell::ExecTool::new());
+        }
+
+        let mut shell_ops = HashMap::new();
+        shell_ops.insert(
+            "safe_commands".to_string(),
+            OperationPermission {
+                min_role: "admin".to_string(),
+                path_whitelist: HashMap::new(),
+                path_blacklist: Vec::new(),
+                allowed: vec!["git *".to_string()],
+            },
+        );
+        let mut tool_configs = HashMap::new();
+        tool_configs.insert(
+            "shell".to_string(),
+            ToolPermissionConfig {
+                operations: shell_ops,
+            },
+        );
+
+        let reg = PermissionAwareRegistry::new(
+            registry,
+            Some(make_rbac_manager(tool_configs)),
+            None,
+            Role::Admin,
+            "admin1".into(),
+        );
+
+        let mut params = HashMap::new();
+        params.insert("command".to_string(), serde_json::json!("rm -rf /"));
+
+        let result = reg.execute("exec", &params).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not in the allowed list"),
+            "expected command allowlist denial"
         );
     }
 }
